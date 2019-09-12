@@ -1,0 +1,7 @@
+apiVersion: jakubbujny.com/v1alpha1
+kind: JenkinsPipeline
+metadata:
+  name: example-jenkinspipeline
+spec:
+  # Add fields here
+  size: 3
