@@ -9,7 +9,7 @@
         <hudson.model.StringParameterDefinition>
           <name>projects</name>
           <description></description>
-          <defaultValue></defaultValue>
+          <defaultValue>default</defaultValue>
           <trim>false</trim>
         </hudson.model.StringParameterDefinition>
       </parameterDefinitions>

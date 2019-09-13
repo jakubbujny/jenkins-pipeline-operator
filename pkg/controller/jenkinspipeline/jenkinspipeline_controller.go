@@ -24,6 +24,7 @@ import (
 	b64 "encoding/base64"
 
 	coreErrors "errors"
+	logr "github.com/go-logr/logr"
 )
 
 var log = logf.Log.WithName("controller_jenkinspipeline")
@@ -108,29 +109,52 @@ func (r *ReconcileJenkinsPipeline) Reconcile(request reconcile.Request) (reconci
 
 	if resp.StatusCode == 404 {
 		reqLogger.Info("Seed job not found so must be created for microservice "+instance.Spec.Microservice)
+
 		resp, err := createSeedJob()
+		err = handleResponse(resp, err, reqLogger, "create seed job")
 		if err != nil {
-			reqLogger.Error(err, "Failed to create seed job")
 			return reconcile.Result{}, err
 		}
-		if resp.StatusCode != 200 {
-			err = coreErrors.New(fmt.Sprintf("Received invalid response from Jenkins %s",resp.Status))
-			reqLogger.Error(err, "Failed to create seed job")
+
+		resp, err = updateSeedJob(instance.Spec.Microservice)
+		err = handleResponse(resp, err, reqLogger, "update seed job")
+		if err != nil {
 			return reconcile.Result{}, err
 		}
-		updateSeedJob()
 	} else if resp.StatusCode == 200 {
 		reqLogger.Info("Seed job found so must be updated for microservice "+instance.Spec.Microservice)
-		updateSeedJob()
+		resp, err = updateSeedJob(instance.Spec.Microservice)
+		err = handleResponse(resp, err, reqLogger, "update seed job")
+		if err != nil {
+			return reconcile.Result{}, err
+		}
 	} else {
 		err = coreErrors.New(fmt.Sprintf("Received invalid response from Jenkins %s",resp.Status))
 		reqLogger.Error(err, "Failed to get seed config to check whether job exists")
 		return reconcile.Result{}, err
 	}
 
-	triggerSeedJob()
+	resp, err = triggerSeedJob()
+	err = handleResponse(resp, err, reqLogger, "trigger seed job")
+	if err != nil {
+		return reconcile.Result{}, err
+	}
 
 	return reconcile.Result{}, nil
+}
+
+func handleResponse( resp *http.Response, err error, reqLogger logr.Logger, action string) error {
+	if err != nil {
+		reqLogger.Error(err, "Failed to "+action)
+		return err
+	}
+
+	if resp.StatusCode != 200 {
+		err = coreErrors.New(fmt.Sprintf("Received invalid response from Jenkins %s",resp.Status))
+		reqLogger.Error(err, "Failed to"+action)
+		return err
+	}
+	return nil
 }
 
 func decorateRequestToJenkinsWithAuth(req *http.Request) {
@@ -151,10 +175,10 @@ func createSeedJob() (*http.Response, error) {
 	seedFileData, err := ioutil.ReadFile("/opt/seed.xml")
 
 	req, err := http.NewRequest("POST", os.Getenv("JENKINS_URL")+"/createItem?name=seed", bytes.NewBuffer(seedFileData))
-	req.Header.Set("Content-type", "text/xml")
 	if err != nil {
 		return nil, err
 	}
+	req.Header.Set("Content-type", "text/xml")
 	decorateRequestToJenkinsWithAuth(req)
 	return (&http.Client{}).Do(req)
 }
@@ -165,29 +189,42 @@ func updateSeedJob(microservice string) (*http.Response, error) {
 		return nil, err
 	}
 	buf := new(bytes.Buffer)
-	buf.ReadFrom(resp.Body)
+	_, err = buf.ReadFrom(resp.Body)
+	if err != nil {
+		return nil, err
+	}
 	seedXml := buf.String()
 
-	r := regexp.MustCompile(`<defaultValue>(.)*<\/defaultValue>`)
+	r := regexp.MustCompile(`<defaultValue>(.+)<\/defaultValue>`)
 	foundMicroservices := r.FindStringSubmatch(seedXml)
 
 	toReplace := ""
-	if strings.Contains(foundMicroservices[0], microservice) {
+	if strings.Contains(foundMicroservices[1], microservice) {
 		return nil,nil
 	} else {
-		if len(foundMicroservices[0]) == 0 {
+		if foundMicroservices[1] == "default" {
 			toReplace = microservice
 		} else {
-			toReplace = foundMicroservices[0] + "," + microservice
+			toReplace = foundMicroservices[1] + "," + microservice
 		}
 	}
 
 	toUpdate := r.ReplaceAllString(seedXml, fmt.Sprintf("<defaultValue>%s</defaultValue>", toReplace))
 
-
-	return nil,nil
+	req, err := http.NewRequest("POST", os.Getenv("JENKINS_URL")+"/job/seed/config.xml", bytes.NewBuffer([]byte(toUpdate)))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-type", "text/xml")
+	decorateRequestToJenkinsWithAuth(req)
+	return (&http.Client{}).Do(req)
 }
 
-func triggerSeedJob() {
-
+func triggerSeedJob() (*http.Response, error) {
+	req, err := http.NewRequest("POST", os.Getenv("JENKINS_URL")+"/job/seed/buildWithParameters", nil)
+	if err != nil {
+		return nil, err
+	}
+	decorateRequestToJenkinsWithAuth(req)
+	return (&http.Client{}).Do(req)
 }
