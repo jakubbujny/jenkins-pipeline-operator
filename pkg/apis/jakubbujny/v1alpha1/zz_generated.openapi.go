@@ -65,7 +65,15 @@ func schema_pkg_apis_jakubbujny_v1alpha1_JenkinsPipelineSpec(ref common.Referenc
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
 				Description: "JenkinsPipelineSpec defines the desired state of JenkinsPipeline",
-				Properties:  map[string]spec.Schema{},
+				Properties: map[string]spec.Schema{
+					"microservice": {
+						SchemaProps: spec.SchemaProps{
+							Type:   []string{"string"},
+							Format: "",
+						},
+					},
+				},
+				Required: []string{"microservice"},
 			},
 		},
 		Dependencies: []string{},

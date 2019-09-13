@@ -1,22 +1,29 @@
 package jenkinspipeline
 
 import (
+	"bytes"
 	"context"
+	"fmt"
+	"io/ioutil"
+	"regexp"
+	"strings"
 
 	jakubbujnyv1alpha1 "github.com/jakubbujny/jenkins-pipeline-operator/pkg/apis/jakubbujny/v1alpha1"
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	logf "sigs.k8s.io/controller-runtime/pkg/runtime/log"
 	"sigs.k8s.io/controller-runtime/pkg/source"
+
+	"os"
+	"net/http"
+	b64 "encoding/base64"
+
+	coreErrors "errors"
 )
 
 var log = logf.Log.WithName("controller_jenkinspipeline")
@@ -51,15 +58,6 @@ func add(mgr manager.Manager, r reconcile.Reconciler) error {
 		return err
 	}
 
-	// TODO(user): Modify this to be the types you create that are owned by the primary resource
-	// Watch for changes to secondary resource Pods and requeue the owner JenkinsPipeline
-	err = c.Watch(&source.Kind{Type: &corev1.Pod{}}, &handler.EnqueueRequestForOwner{
-		IsController: true,
-		OwnerType:    &jakubbujnyv1alpha1.JenkinsPipeline{},
-	})
-	if err != nil {
-		return err
-	}
 
 	return nil
 }
@@ -82,6 +80,7 @@ type ReconcileJenkinsPipeline struct {
 // Note:
 // The Controller will requeue the Request to be processed again if the returned error is non-nil or
 // Result.Requeue is true, otherwise upon completion it will remove the work from the queue.
+
 func (r *ReconcileJenkinsPipeline) Reconcile(request reconcile.Request) (reconcile.Result, error) {
 	reqLogger := log.WithValues("Request.Namespace", request.Namespace, "Request.Name", request.Name)
 	reqLogger.Info("Reconciling JenkinsPipeline")
@@ -100,54 +99,95 @@ func (r *ReconcileJenkinsPipeline) Reconcile(request reconcile.Request) (reconci
 		return reconcile.Result{}, err
 	}
 
-	// Define a new Pod object
-	pod := newPodForCR(instance)
+	resp, err := getSeedJob()
 
-	// Set JenkinsPipeline instance as the owner and controller
-	if err := controllerutil.SetControllerReference(instance, pod, r.scheme); err != nil {
+	if err != nil {
+		reqLogger.Error(err, "Failed to get seed config to check whether job exists")
 		return reconcile.Result{}, err
 	}
 
-	// Check if this Pod already exists
-	found := &corev1.Pod{}
-	err = r.client.Get(context.TODO(), types.NamespacedName{Name: pod.Name, Namespace: pod.Namespace}, found)
-	if err != nil && errors.IsNotFound(err) {
-		reqLogger.Info("Creating a new Pod", "Pod.Namespace", pod.Namespace, "Pod.Name", pod.Name)
-		err = r.client.Create(context.TODO(), pod)
+	if resp.StatusCode == 404 {
+		reqLogger.Info("Seed job not found so must be created for microservice "+instance.Spec.Microservice)
+		resp, err := createSeedJob()
 		if err != nil {
+			reqLogger.Error(err, "Failed to create seed job")
 			return reconcile.Result{}, err
 		}
-
-		// Pod created successfully - don't requeue
-		return reconcile.Result{}, nil
-	} else if err != nil {
+		if resp.StatusCode != 200 {
+			err = coreErrors.New(fmt.Sprintf("Received invalid response from Jenkins %s",resp.Status))
+			reqLogger.Error(err, "Failed to create seed job")
+			return reconcile.Result{}, err
+		}
+		updateSeedJob()
+	} else if resp.StatusCode == 200 {
+		reqLogger.Info("Seed job found so must be updated for microservice "+instance.Spec.Microservice)
+		updateSeedJob()
+	} else {
+		err = coreErrors.New(fmt.Sprintf("Received invalid response from Jenkins %s",resp.Status))
+		reqLogger.Error(err, "Failed to get seed config to check whether job exists")
 		return reconcile.Result{}, err
 	}
 
-	// Pod already exists - don't requeue
-	reqLogger.Info("Skip reconcile: Pod already exists", "Pod.Namespace", found.Namespace, "Pod.Name", found.Name)
+	triggerSeedJob()
+
 	return reconcile.Result{}, nil
 }
 
-// newPodForCR returns a busybox pod with the same name/namespace as the cr
-func newPodForCR(cr *jakubbujnyv1alpha1.JenkinsPipeline) *corev1.Pod {
-	labels := map[string]string{
-		"app": cr.Name,
+func decorateRequestToJenkinsWithAuth(req *http.Request) {
+	jenkinsApiToken := os.Getenv("JENKINS_API_TOKEN")
+	req.Header.Add("Authorization", "Basic "+ b64.StdEncoding.EncodeToString([]byte("admin:"+jenkinsApiToken)))
+}
+
+func getSeedJob() (*http.Response, error) {
+	req, err := http.NewRequest("GET", os.Getenv("JENKINS_URL")+"/job/seed/config.xml", nil)
+	if err != nil {
+		return nil, err
 	}
-	return &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      cr.Name + "-pod",
-			Namespace: cr.Namespace,
-			Labels:    labels,
-		},
-		Spec: corev1.PodSpec{
-			Containers: []corev1.Container{
-				{
-					Name:    "busybox",
-					Image:   "busybox",
-					Command: []string{"sleep", "3600"},
-				},
-			},
-		},
+	decorateRequestToJenkinsWithAuth(req)
+	return (&http.Client{}).Do(req)
+}
+
+func createSeedJob() (*http.Response, error) {
+	seedFileData, err := ioutil.ReadFile("/opt/seed.xml")
+
+	req, err := http.NewRequest("POST", os.Getenv("JENKINS_URL")+"/createItem?name=seed", bytes.NewBuffer(seedFileData))
+	req.Header.Set("Content-type", "text/xml")
+	if err != nil {
+		return nil, err
 	}
+	decorateRequestToJenkinsWithAuth(req)
+	return (&http.Client{}).Do(req)
+}
+
+func updateSeedJob(microservice string) (*http.Response, error) {
+	resp, err := getSeedJob()
+	if err != nil {
+		return nil, err
+	}
+	buf := new(bytes.Buffer)
+	buf.ReadFrom(resp.Body)
+	seedXml := buf.String()
+
+	r := regexp.MustCompile(`<defaultValue>(.)*<\/defaultValue>`)
+	foundMicroservices := r.FindStringSubmatch(seedXml)
+
+	toReplace := ""
+	if strings.Contains(foundMicroservices[0], microservice) {
+		return nil,nil
+	} else {
+		if len(foundMicroservices[0]) == 0 {
+			toReplace = microservice
+		} else {
+			toReplace = foundMicroservices[0] + "," + microservice
+		}
+	}
+
+	toUpdate := r.ReplaceAllString(seedXml, fmt.Sprintf("<defaultValue>%s</defaultValue>", toReplace))
+
+
+	return nil,nil
+}
+
+func triggerSeedJob() {
+
 }

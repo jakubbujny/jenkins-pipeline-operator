@@ -7,6 +7,8 @@ ENV OPERATOR=/usr/local/bin/jenkins-pipeline-operator \
 # install operator binary
 COPY build/_output/bin/jenkins-pipeline-operator ${OPERATOR}
 
+ADD build/seed.xml /opt/seed.xml
+
 COPY build/bin /usr/local/bin
 RUN  /usr/local/bin/user_setup
 
