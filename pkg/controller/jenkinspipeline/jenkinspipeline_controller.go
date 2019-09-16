@@ -149,6 +149,10 @@ func handleResponse( resp *http.Response, err error, reqLogger logr.Logger, acti
 		return err
 	}
 
+	if resp == nil {
+		return nil
+	}
+
 	if resp.StatusCode != 200 {
 		err = coreErrors.New(fmt.Sprintf("Received invalid response from Jenkins %s",resp.Status))
 		reqLogger.Error(err, "Failed to"+action)
